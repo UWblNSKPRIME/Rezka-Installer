@@ -1,0 +1,8 @@
+selenium>=4.18.1,<5.0.0
+undetected-chromedriver>=3.5.5,<3.6.0
+selenium-wire>=5.1.0,<5.2.0
+yt-dlp>=2024.11.4,<2026.0.0
+ffmpeg-python>=0.2.0,<0.3.0
+setuptools<82
+blinker==1.7.0
+pyopenssl==23.3.0

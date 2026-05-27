@@ -1,0 +1,25 @@
+# Python files
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Environments
+.venv/
+venv/
+ENV/
+env/
+
+# PyInstaller / Build outputs
+build/
+dist/
+*.spec
+
+# Downloader specific outputs
+downloads/
+test_downloads/
+*.log
+
+# CRX extension cache
+ublock_lite.crx
+ubol_extension/
