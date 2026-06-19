@@ -135,6 +135,74 @@ def _deduplicate_elements(elements: list) -> list:
     return unique
 
 
+def parse_subtitles(subtitle_str: str | None, subtitle_lns: dict | None) -> dict[str, str]:
+    """Parses raw subtitle string into a dictionary of {lang_code: url}."""
+    subs: dict[str, str] = {}
+    if not subtitle_str:
+        return subs
+    try:
+        items = subtitle_str.split(",")
+        for item in items:
+            item = item.strip()
+            if not item:
+                continue
+            if "[" in item and "]" in item:
+                parts = item.split("[", 1)[1].split("]", 1)
+                if len(parts) == 2:
+                    lang = parts[0].strip()
+                    url = parts[1].strip().replace(r"\/", "/")
+                    code = None
+                    if subtitle_lns and isinstance(subtitle_lns, dict):
+                        code = subtitle_lns.get(lang)
+                    if code:
+                        subs[code.lower()] = url
+                    else:
+                        lang_lower = lang.lower()
+                        if "рус" in lang_lower:
+                            subs["ru"] = url
+                        elif "анг" in lang_lower or "eng" in lang_lower:
+                            subs["en"] = url
+                        else:
+                            subs[lang_lower] = url
+    except Exception as e:
+        log.error("Error parsing subtitles: %s", e)
+    return subs
+
+
+def select_subtitle_url(subtitles: dict[str, str]) -> tuple[str | None, str | None]:
+    """Selects Russian subtitle URL if available, otherwise English, otherwise first available.
+    Returns (lang_code, url) or (None, None)."""
+    if not subtitles:
+        return None, None
+    if "ru" in subtitles:
+        return "ru", subtitles["ru"]
+    for k in subtitles:
+        if "ru" in k:
+            return k, subtitles[k]
+    if "en" in subtitles:
+        return "en", subtitles["en"]
+    for k in subtitles:
+        if "en" in k:
+            return k, subtitles[k]
+    first_lang = list(subtitles.keys())[0]
+    return first_lang, subtitles[first_lang]
+
+
+def download_subtitle(url: str, headers: dict[str, str], output_path: str) -> bool:
+    """Downloads a subtitle VTT file using the provided headers."""
+    try:
+        req = urllib.request.Request(url, headers=headers)
+        with urllib.request.urlopen(req, timeout=30) as response:
+            content = response.read()
+        with open(output_path, "wb") as f:
+            f.write(content)
+        log.info("Subtitles downloaded successfully to: %s", output_path)
+        return True
+    except Exception as e:
+        log.error("Failed to download subtitles from %s: %s", url, e)
+        return False
+
+
 # ---------------------------------------------------------------------------
 # Page information helpers (F26)
 # ---------------------------------------------------------------------------
@@ -907,8 +975,8 @@ def _get_stream_via_fetch(
     quality: str = "best",
     season_num: str | None = None,
     episode_num: str | None = None,
-) -> tuple[str | None, dict[str, str] | None]:
-    """Retrieves stream URL directly using browser-side fetch and local decryption."""
+) -> tuple[str | None, dict[str, str] | None, dict[str, str]]:
+    """Retrieves stream URL and subtitles directly using browser-side fetch and local decryption."""
     try:
         post_id = driver.execute_script("""
             var el = document.querySelector('#post_id') || document.querySelector('#send-video-issue');
@@ -916,7 +984,7 @@ def _get_stream_via_fetch(
         """)
         if not post_id:
             log.error("Could not find post_id in DOM.")
-            return None, None
+            return None, None, {}
             
         translator_id = driver.execute_script("""
             var el = document.querySelector('#translators-list .b-translator__item.active');
@@ -931,7 +999,7 @@ def _get_stream_via_fetch(
         """)
         if not translator_id:
             log.error("Could not find active translator_id.")
-            return None, None
+            return None, None, {}
             
         fetch_js = """
             var params = arguments[0];
@@ -965,18 +1033,18 @@ def _get_stream_via_fetch(
         
         if not result or not result.get("success"):
             log.error("Fetch request failed: %s", result.get("error") if result else "No response")
-            return None, None
+            return None, None, {}
             
         url_str = result.get("url")
         if not url_str:
             log.error("No url field in fetch response.")
-            return None, None
+            return None, None, {}
             
         decrypted = clear_trash(url_str)
         streams = parse_streams(decrypted)
         if not streams:
             log.error("Failed to parse streams from decrypted data.")
-            return None, None
+            return None, None, {}
             
         chosen_url = select_quality_url(streams, quality)
         log.info("Successfully fetched direct URL for quality %s: %s", quality, chosen_url[:120] + "...")
@@ -994,12 +1062,16 @@ def _get_stream_via_fetch(
                 origin_request = r
                 break
         
+        subtitles_raw = result.get("subtitle")
+        subtitle_lns = result.get("subtitle_lns")
+        subtitles_dict = parse_subtitles(subtitles_raw, subtitle_lns)
+
         req_headers = origin_request.headers if origin_request else None
-        return chosen_url, req_headers
+        return chosen_url, req_headers, subtitles_dict
         
     except Exception as exc:
         log.exception("Error fetching stream URL via AJAX")
-        return None, None
+        return None, None, {}
 
 # ---------------------------------------------------------------------------
 
@@ -1127,7 +1199,9 @@ def _download_episode(
         time.sleep(1.0)  # graceful fallback
 
     log.info("Fetching stream URL via browser-side AJAX...")
-    stream_url, req_headers = _get_stream_via_fetch(driver, quality=quality, season_num=season_num, episode_num=ep_data["num"])
+    subtitles = {}
+    fetch_result = _get_stream_via_fetch(driver, quality=quality, season_num=season_num, episode_num=ep_data["num"])
+    stream_url, req_headers, subtitles = fetch_result
 
     if not stream_url:
         log.warning("AJAX fetch failed. Falling back to player network interception...")
@@ -1154,6 +1228,14 @@ def _download_episode(
     headers = _build_headers(req_headers, referer=driver.current_url)
     os.makedirs(output_dir, exist_ok=True)
     download_video(stream_url, headers, output_path, max_retries=3, quality=quality)
+
+    if subtitles:
+        lang_code, sub_url = select_subtitle_url(subtitles)
+        if sub_url and lang_code:
+            video_base_path = os.path.splitext(output_path)[0]
+            sub_output_path = f"{video_base_path}.{lang_code}.vtt"
+            log.info("Found subtitles for language '%s'. Downloading...", lang_code)
+            download_subtitle(sub_url, headers, sub_output_path)
 
 
 # ---------------------------------------------------------------------------
@@ -1330,7 +1412,9 @@ def _handle_movie(
         return
 
     log.info("Fetching stream URL via browser-side AJAX...")
-    stream_url, req_headers = _get_stream_via_fetch(driver, quality=args.quality)
+    subtitles = {}
+    fetch_result = _get_stream_via_fetch(driver, quality=args.quality)
+    stream_url, req_headers, subtitles = fetch_result
     
     if not stream_url:
         log.warning("AJAX fetch failed. Falling back to player network interception...")
@@ -1357,6 +1441,14 @@ def _handle_movie(
     headers = _build_headers(req_headers, referer=driver.current_url)
     os.makedirs(output_dir, exist_ok=True)
     download_video(stream_url, headers, output_path, max_retries=3, quality=args.quality)
+
+    if subtitles:
+        lang_code, sub_url = select_subtitle_url(subtitles)
+        if sub_url and lang_code:
+            video_base_path = os.path.splitext(output_path)[0]
+            sub_output_path = f"{video_base_path}.{lang_code}.vtt"
+            log.info("Found subtitles for language '%s'. Downloading...", lang_code)
+            download_subtitle(sub_url, headers, sub_output_path)
 
 
 def _fetch_available_qualities(driver: uc.Chrome) -> list[str]:
